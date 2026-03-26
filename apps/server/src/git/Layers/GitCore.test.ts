@@ -1572,7 +1572,7 @@ it.layer(TestLayer)("git integration", (it) => {
     );
 
     it.effect(
-      "refreshes upstream before statusDetails so behind count reflects remote updates",
+      "scheduled status upstream refresh updates behind count without blocking status",
       () =>
         Effect.gen(function* () {
           const remote = yield* makeTmpDir();
@@ -1580,10 +1580,7 @@ it.layer(TestLayer)("git integration", (it) => {
           const clone = yield* makeTmpDir();
           yield* git(remote, ["init", "--bare"]);
 
-          yield* initRepoWithCommit(source);
-          const initialBranch = (yield* (yield* GitCore).listBranches({
-            cwd: source,
-          })).branches.find((branch) => branch.current)!.name;
+          const { initialBranch } = yield* initRepoWithCommit(source);
           yield* git(source, ["remote", "add", "origin", remote]);
           yield* git(source, ["push", "-u", "origin", initialBranch]);
 
@@ -1603,14 +1600,22 @@ it.layer(TestLayer)("git integration", (it) => {
           yield* git(clone, ["push", "origin", initialBranch]);
 
           const core = yield* GitCore;
-          const details = yield* core.statusDetails(source);
-          expect(details.branch).toBe(initialBranch);
-          expect(details.aheadCount).toBe(0);
-          expect(details.behindCount).toBe(1);
+          const beforeRefresh = yield* core.statusDetails(source);
+          expect(beforeRefresh.behindCount).toBe(0);
+
+          yield* core.scheduleStatusUpstreamRefresh(source);
+          yield* Effect.promise(() =>
+            vi.waitFor(async () => {
+              const details = await Effect.runPromise(core.statusDetails(source));
+              expect(details.branch).toBe(initialBranch);
+              expect(details.aheadCount).toBe(0);
+              expect(details.behindCount).toBe(1);
+            }),
+          );
         }),
     );
 
-    it.effect("uses an extended timeout for status upstream refresh fetches", () =>
+    it.effect("uses an extended timeout for scheduled status upstream refresh fetches", () =>
       Effect.gen(function* () {
         const remote = yield* makeTmpDir();
         const source = yield* makeTmpDir();
@@ -1630,14 +1635,16 @@ it.layer(TestLayer)("git integration", (it) => {
           return realGitCore.execute(input);
         });
 
-        const details = yield* core.statusDetails(source);
-
-        expect(details.branch).toBe(initialBranch);
-        expect(statusRefreshTimeoutMs).toBe(300_000);
+        yield* core.scheduleStatusUpstreamRefresh(source);
+        yield* Effect.promise(() =>
+          vi.waitFor(() => {
+            expect(statusRefreshTimeoutMs).toBe(300_000);
+          }),
+        );
       }),
     );
 
-    it.effect("deduplicates in-flight status upstream refresh fetches", () =>
+    it.effect("deduplicates in-flight scheduled status upstream refresh fetches", () =>
       Effect.gen(function* () {
         const remote = yield* makeTmpDir();
         const source = yield* makeTmpDir();
@@ -1660,26 +1667,19 @@ it.layer(TestLayer)("git integration", (it) => {
               waitForReleasePromise.then(() => ({ code: 0, stdout: "", stderr: "" })),
             );
           }
-          if (input.operation === "GitCore.statusDetails.status") {
-            return Effect.succeed({
-              code: 0,
-              stdout: `# branch.head ${initialBranch}\n# branch.upstream origin/${initialBranch}\n# branch.ab +0 -0\n`,
-              stderr: "",
-            });
-          }
-          if (
-            input.operation === "GitCore.statusDetails.unstagedNumstat" ||
-            input.operation === "GitCore.statusDetails.stagedNumstat"
-          ) {
-            return Effect.succeed({ code: 0, stdout: "", stderr: "" });
-          }
           return realGitCore.execute(input);
         });
 
-        const statusFiber = yield* Effect.forkScoped(
-          Effect.all([core.statusDetails(source), core.statusDetails(source)], {
-            concurrency: "unbounded",
-          }),
+        const refreshFiber = yield* Effect.forkScoped(
+          Effect.all(
+            [
+              core.scheduleStatusUpstreamRefresh(source),
+              core.scheduleStatusUpstreamRefresh(source),
+            ],
+            {
+              concurrency: "unbounded",
+            },
+          ),
         );
 
         yield* Effect.promise(() =>
@@ -1689,9 +1689,7 @@ it.layer(TestLayer)("git integration", (it) => {
         );
 
         releaseFetch();
-        const [first, second] = yield* Fiber.join(statusFiber);
-        expect(first.branch).toBe(initialBranch);
-        expect(second.branch).toBe(initialBranch);
+        yield* Fiber.join(refreshFiber);
       }),
     );
 

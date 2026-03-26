@@ -148,6 +148,11 @@ export interface GitCoreShape {
   readonly statusDetails: (cwd: string) => Effect.Effect<GitStatusDetails, GitCommandError>;
 
   /**
+   * Schedule a best-effort upstream refresh for passive status reads without blocking on auth/network.
+   */
+  readonly scheduleStatusUpstreamRefresh: (cwd: string) => Effect.Effect<void, never>;
+
+  /**
    * Build staged change context for commit generation.
    */
   readonly prepareCommitContext: (

@@ -923,6 +923,7 @@ export const makeGitManager = Effect.gen(function* () {
     });
 
   const status: GitManagerShape["status"] = Effect.fnUntraced(function* (input) {
+    yield* gitCore.scheduleStatusUpstreamRefresh(input.cwd);
     const details = yield* gitCore.statusDetails(input.cwd);
 
     const pr =

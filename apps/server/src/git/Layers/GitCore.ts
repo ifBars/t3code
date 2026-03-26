@@ -497,6 +497,8 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const { worktreesDir } = yield* ServerConfig;
+    const statusRefreshScope = yield* Scope.make("sequential");
+    yield* Effect.addFinalizer(() => Scope.close(statusRefreshScope, Exit.void));
 
     let execute: GitCoreShape["execute"];
 
@@ -779,6 +781,13 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
         );
       });
 
+    const scheduleStatusUpstreamRefresh: GitCoreShape["scheduleStatusUpstreamRefresh"] = (cwd) =>
+      refreshStatusUpstreamIfStale(cwd).pipe(
+        Effect.ignoreCause({ log: true }),
+        Effect.forkIn(statusRefreshScope),
+        Effect.asVoid,
+      );
+
     const refreshCheckedOutBranchUpstream = (cwd: string): Effect.Effect<void, GitCommandError> =>
       Effect.gen(function* () {
         const upstream = yield* resolveCurrentUpstream(cwd);
@@ -1025,8 +1034,6 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
 
     const statusDetails: GitCoreShape["statusDetails"] = (cwd) =>
       Effect.gen(function* () {
-        yield* refreshStatusUpstreamIfStale(cwd).pipe(Effect.ignoreCause({ log: true }));
-
         const [statusStdout, unstagedNumstatStdout, stagedNumstatStdout] = yield* Effect.all(
           [
             runGitStdout("GitCore.statusDetails.status", cwd, [
@@ -1797,6 +1804,7 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
       execute,
       status,
       statusDetails,
+      scheduleStatusUpstreamRefresh,
       prepareCommitContext,
       commit,
       pushCurrentBranch,
