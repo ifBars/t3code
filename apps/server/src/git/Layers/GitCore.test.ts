@@ -3,7 +3,7 @@ import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { Effect, FileSystem, Layer, PlatformError, Scope } from "effect";
+import { Effect, Fiber, FileSystem, Layer, PlatformError, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
 import { GitCoreLive, makeGitCore } from "./GitCore.ts";
@@ -1608,6 +1608,91 @@ it.layer(TestLayer)("git integration", (it) => {
           expect(details.aheadCount).toBe(0);
           expect(details.behindCount).toBe(1);
         }),
+    );
+
+    it.effect("uses an extended timeout for status upstream refresh fetches", () =>
+      Effect.gen(function* () {
+        const remote = yield* makeTmpDir();
+        const source = yield* makeTmpDir();
+        yield* git(remote, ["init", "--bare"]);
+
+        const { initialBranch } = yield* initRepoWithCommit(source);
+        yield* git(source, ["remote", "add", "origin", remote]);
+        yield* git(source, ["push", "-u", "origin", initialBranch]);
+
+        const realGitCore = yield* GitCore;
+        let statusRefreshTimeoutMs: number | undefined;
+        const core = yield* makeIsolatedGitCore((input) => {
+          if (input.operation === "GitCore.fetchUpstreamRefForStatus") {
+            statusRefreshTimeoutMs = input.timeoutMs;
+            return Effect.succeed({ code: 0, stdout: "", stderr: "" });
+          }
+          return realGitCore.execute(input);
+        });
+
+        const details = yield* core.statusDetails(source);
+
+        expect(details.branch).toBe(initialBranch);
+        expect(statusRefreshTimeoutMs).toBe(300_000);
+      }),
+    );
+
+    it.effect("deduplicates in-flight status upstream refresh fetches", () =>
+      Effect.gen(function* () {
+        const remote = yield* makeTmpDir();
+        const source = yield* makeTmpDir();
+        yield* git(remote, ["init", "--bare"]);
+
+        const { initialBranch } = yield* initRepoWithCommit(source);
+        yield* git(source, ["remote", "add", "origin", remote]);
+        yield* git(source, ["push", "-u", "origin", initialBranch]);
+
+        const realGitCore = yield* GitCore;
+        let refreshFetchAttempts = 0;
+        let releaseFetch!: () => void;
+        const waitForReleasePromise = new Promise<void>((resolve) => {
+          releaseFetch = resolve;
+        });
+        const core = yield* makeIsolatedGitCore((input) => {
+          if (input.operation === "GitCore.fetchUpstreamRefForStatus") {
+            refreshFetchAttempts += 1;
+            return Effect.promise(() =>
+              waitForReleasePromise.then(() => ({ code: 0, stdout: "", stderr: "" })),
+            );
+          }
+          if (input.operation === "GitCore.statusDetails.status") {
+            return Effect.succeed({
+              code: 0,
+              stdout: `# branch.head ${initialBranch}\n# branch.upstream origin/${initialBranch}\n# branch.ab +0 -0\n`,
+              stderr: "",
+            });
+          }
+          if (
+            input.operation === "GitCore.statusDetails.unstagedNumstat" ||
+            input.operation === "GitCore.statusDetails.stagedNumstat"
+          ) {
+            return Effect.succeed({ code: 0, stdout: "", stderr: "" });
+          }
+          return realGitCore.execute(input);
+        });
+
+        const statusFiber = yield* Effect.forkScoped(
+          Effect.all([core.statusDetails(source), core.statusDetails(source)], {
+            concurrency: "unbounded",
+          }),
+        );
+
+        yield* Effect.promise(() =>
+          vi.waitFor(() => {
+            expect(refreshFetchAttempts).toBe(1);
+          }),
+        );
+
+        releaseFetch();
+        const [first, second] = yield* Fiber.join(statusFiber);
+        expect(first.branch).toBe(initialBranch);
+        expect(second.branch).toBe(initialBranch);
+      }),
     );
 
     it.effect("prepares commit context by auto-staging and creates commit", () =>
